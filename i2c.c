@@ -3,7 +3,7 @@
 
   Part of grblHAL driver for RP2040
 
-  Copyright (c) 2021 Terje Io
+  Copyright (c) 2021-2023 Terje Io
 
   Grbl is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -24,27 +24,69 @@
 
 #include "hardware/gpio.h"
 #include "hardware/i2c.h"
+#include "hardware/dma.h"
+#include "hardware/irq.h"
 
 #include "i2c.h"
 #include "grbl/hal.h"
 
-#if KEYPAD_ENABLE == 1
-#include "keypad/keypad.h"
-#endif
-
-//#define QI2C_PORT i2c0
 #define MAX_PAGE_SIZE 64
+#define I2C_MAX_TSIZE 256
 
 #define I2CN_PORT(port) I2Cn(port)
-#define I2Cn(port) i2c ## port
+#define I2Cn(port) i2c##port
+#define I2CN_IRQ(port) I2Cirq(port)
+#define I2Cirq(port) I2C##port##_IRQ
 
 #if I2C_ENABLE
 
 #define QI2C_PORT I2CN_PORT(I2C_PORT)
+#define QI2C_IRQ I2CN_IRQ(I2C_PORT)
+
+typedef union
+{
+    uint16_t value;
+    struct
+    {
+        uint8_t data;
+        uint8_t cmd;
+    };
+} i2c_data_t;
+
+typedef struct
+{
+    size_t len;
+    int channel;
+    bool busy;
+    i2c_hw_t *port;
+    i2c_data_t payload[I2C_MAX_TSIZE];
+} i2c_trans_t;
+
+static i2c_trans_t tx = {0};
+static uint8_t keycode = 0;
+static keycode_callback_ptr keypad_callback = NULL;
+
+void i2c_irq_handler(void)
+{
+    const uint32_t event = tx.port->intr_stat;
+
+    if(event & I2C_IC_INTR_STAT_R_TX_ABRT_BITS) {
+        tx.port->clr_tx_abrt;
+
+        if(tx.busy) {
+            dma_channel_abort(tx.channel);
+            tx.busy = false;
+        }
+    }
+
+    if(event & I2C_IC_INTR_STAT_R_STOP_DET_BITS) {
+        tx.port->clr_stop_det;
+        tx.busy = false;
+    }
+}
 
 void I2C_Init (void)
 {
-
     gpio_set_function(I2C_SDA, GPIO_FUNC_I2C);
     gpio_set_function(I2C_SCL, GPIO_FUNC_I2C);
 
@@ -66,21 +108,84 @@ void I2C_Init (void)
 
     hal.periph_port.register_pin(&scl);
     hal.periph_port.register_pin(&sda);
+
+    tx.port = i2c_get_hw(QI2C_PORT);   
+    tx.port->intr_mask = I2C_IC_INTR_MASK_M_STOP_DET_BITS|I2C_IC_INTR_MASK_M_TX_ABRT_BITS;
+    tx.channel = dma_claim_unused_channel(false);
+
+    irq_set_exclusive_handler(QI2C_IRQ, i2c_irq_handler);
+    irq_set_enabled(QI2C_IRQ, true);
 }
 
-void I2C_Send (uint32_t i2cAddr, uint8_t *buf, uint16_t bytes, bool block)
+bool i2c_probe (uint_fast16_t i2cAddr)
 {
+    char buf = '\0';
 
-    i2c_write_blocking(QI2C_PORT, i2cAddr, buf, bytes, false);
+    return i2c_read_blocking(QI2C_PORT, i2cAddr, &buf, 1, false) != PICO_ERROR_GENERIC;
+}
+
+// TODO: add timeout handling
+bool i2c_send (uint_fast16_t i2cAddr, uint8_t *buf, size_t bytes, bool block)
+{
+    bool ok;
+
+    if((ok = block || tx.channel == -1)) {
+ 
+        while(tx.busy) {
+            if(!hal.stream_blocking_callback())
+                return false;
+        }
+
+        ok = i2c_write_blocking(QI2C_PORT, i2cAddr, buf, bytes, false) == bytes;
+    } else {
+
+        if(tx.busy)
+            return false;
+
+        uint16_t *data = &tx.payload[0].value;
+
+        tx.len = bytes;
+
+        while(bytes--)
+            *data++ = *buf++;
+
+        tx.payload[0].value |= I2C_IC_DATA_CMD_RESTART_BITS;
+        tx.payload[tx.len - 1].value |= I2C_IC_DATA_CMD_STOP_BITS;
+
+        tx.port->enable = 0;
+        tx.port->tar = i2cAddr;
+        tx.port->enable = 1;
+
+        dma_channel_config cfg = dma_channel_get_default_config(tx.channel);
+        channel_config_set_read_increment(&cfg, true);
+        channel_config_set_write_increment(&cfg, false);
+        channel_config_set_transfer_data_size(&cfg, DMA_SIZE_16);
+        channel_config_set_dreq(&cfg, i2c_get_dreq(QI2C_PORT, true));
+
+        dma_channel_configure(tx.channel, &cfg, &tx.port->data_cmd, tx.payload, tx.len, true);
+
+        ok = true;
+    }
+
+    return ok;
 }
 
 uint8_t *I2C_ReadRegister (uint32_t i2cAddr, uint8_t *buf, uint16_t bytes, bool block)
 {
-
     i2c_write_blocking(QI2C_PORT, i2cAddr, buf, 1, true);
     i2c_read_blocking(QI2C_PORT, i2cAddr, buf, bytes, false);
 
     return buf;
+}
+
+void i2c_get_keycode (uint_fast16_t i2cAddr, keycode_callback_ptr callback)
+{
+    uint8_t c;
+    keycode = 0;
+    keypad_callback = callback;
+
+    if(i2c_read_blocking(QI2C_PORT, i2cAddr, &c, 1, false) == 1)
+        keypad_callback(c);
 }
 
 #endif
@@ -89,7 +194,6 @@ uint8_t *I2C_ReadRegister (uint32_t i2cAddr, uint8_t *buf, uint16_t bytes, bool 
 
 nvs_transfer_result_t i2c_nvs_transfer (nvs_transfer_t *i2c, bool read)
 {
-
     static uint8_t txbuf[MAX_PAGE_SIZE + 2];
 
     int retval = 0;
@@ -120,20 +224,6 @@ nvs_transfer_result_t i2c_nvs_transfer (nvs_transfer_t *i2c, bool read)
 
 #endif
 
-#if KEYPAD_ENABLE == 1
-
-static uint8_t keycode = 0;
-static keycode_callback_ptr keypad_callback = NULL;
-
-void I2C_GetKeycode (uint32_t i2cAddr, keycode_callback_ptr callback)
-{
-    uint8_t c;
-    keycode = 0;
-    keypad_callback = callback;
-
-    if(i2c_read_blocking(QI2C_PORT, KEYPAD_I2CADDR, &c, 1, false) == 1)
-        keypad_callback(c);
-}
 /*
 void HAL_I2C_MasterRxCpltCallback(I2C_HandleTypeDef *hi2c)
 {
@@ -143,7 +233,6 @@ void HAL_I2C_MasterRxCpltCallback(I2C_HandleTypeDef *hi2c)
     }
 }
 */
-#endif
 
 #if TRINAMIC_ENABLE && TRINAMIC_I2C
 
@@ -154,9 +243,9 @@ static TMC2130_status_t TMC_I2C_ReadRegister (TMC2130_t *driver, TMC2130_datagra
     uint8_t tmc_reg, buffer[5] = {0};
     TMC2130_status_t status = {0};
 
-    if((tmc_reg = TMCI2C_GetMapAddress((uint8_t)(driver ? (uint32_t)driver->cs_pin : 0), reg->addr).value) == 0xFF) {
+    if((tmc_reg = TMCI2C_GetMapAddress((uint8_t)(driver ? (uint32_t)driver->cs_pin : 0), reg->addr).value) == 0xFF)
         return status; // unsupported register
-    }
+
 
     HAL_I2C_Mem_Read(&i2c_port, tmc_addr, tmc_reg, I2C_MEMADD_SIZE_8BIT, buffer, 5, 100);
 

@@ -42,7 +42,7 @@
 #include "grbl/nvs_buffer.h"
 #include "grbl/protocol.h"
 
-#define WIFI_DEBUG
+//#define WIFI_DEBUG
 #define USE_LWIP_POLLING 1
 
 typedef struct
@@ -1261,7 +1261,7 @@ static const setting_descr_t ethernet_settings_descr[] = {
     { Setting_MQTTBrokerIpAddress, "IP address for remote MQTT broker. Set to 0.0.0.0 to disable connection." },
     { Setting_MQTTBrokerPort, "Remote MQTT broker portnumber." },
     { Setting_MQTTBrokerUserName, "Remote MQTT broker username." },
-    { Setting_MQTTBrokerPassword, "Remote MQTT broker username." },
+    { Setting_MQTTBrokerPassword, "Remote MQTT broker password." },
 #endif
 };
 
@@ -1282,18 +1282,18 @@ static void wifi_settings_restore (void)
 
 // Station
 
-    strlcpy(wifi.sta.network.hostname, NETWORK_HOSTNAME, sizeof(wifi.sta.network.hostname));
+    strlcpy(wifi.sta.network.hostname, NETWORK_STA_HOSTNAME, sizeof(wifi.sta.network.hostname));
 
-    wifi.sta.network.ip_mode = (ip_mode_t)NETWORK_IPMODE;
+    wifi.sta.network.ip_mode = (ip_mode_t)NETWORK_STA_IPMODE;
 
-    if(ip4addr_aton(NETWORK_IP, &addr) == 1)
+    if(ip4addr_aton(NETWORK_STA_IP, &addr) == 1)
         set_addr(wifi.sta.network.ip, &addr);
 
-    if(ip4addr_aton(NETWORK_GATEWAY, &addr) == 1)
+    if(ip4addr_aton(NETWORK_STA_GATEWAY, &addr) == 1)
         set_addr(wifi.sta.network.gateway, &addr);
 
-#if NETWORK_IPMODE == 0
-    if(ip4addr_aton(NETWORK_MASK, &addr) == 1)
+#if NETWORK_STA_IPMODE == 0
+    if(ip4addr_aton(NETWORK_STA_MASK, &addr) == 1)
         set_addr(wifi.sta.network.mask, &addr);
  #else
     if(ip4addr_aton("255.255.255.0", &addr) == 1)
